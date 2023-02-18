@@ -32,28 +32,101 @@ def load_libnat():
             )
             raise e
 
+def _get_pld_len(mask_ins_score, output_tokens, initial_ins_pred, K, pad):
+    from fairseq import libnat
+    #print("output tokens: ", output_tokens)
+    output_masks = output_tokens.ne(pad)
+    Ls = output_masks.sum(dim=-1)
+    mask_ins_proba = torch.nn.functional.softmax(mask_ins_score, dim=-1)
+    Ps = -torch.log(mask_ins_proba.float())
 
-def _get_ins_targets(in_tokens, out_tokens, padding_idx, unk_idx):
+    # print("output tokens: ", output_tokens.shape, output_tokens)
+    # print("Ls: ", Ls)
+    # print("obj: ", initial_ins_pred)
+    # print("Ps: ", Ps.shape)
+    
+    full_preds = libnat.suggested_pld_len(Ps.tolist(), Ls.tolist(), initial_ins_pred.squeeze(dim=-1).tolist(), K)  # (batch * Ls-1, batch * Ls-1)
+    # print("full preds", full_preds)
+    predecessors = torch.tensor(full_preds[0], dtype=output_tokens.dtype, device=output_tokens.device)
+    costs =full_preds[1]
+
+    # print("pld preds: ", predecessors.shape, predecessors)
+
+    return predecessors
+
+def _get_ins_targets(in_tokens, out_tokens, padding_idx, unk_idx, aggravate=False):
     libnat, use_cuda = load_libnat()
 
     def _get_ins_targets_cuda(in_tokens, out_tokens, padding_idx, unk_idx):
         in_masks = in_tokens.ne(padding_idx)
         out_masks = out_tokens.ne(padding_idx)
-        mask_ins_targets, masked_tgt_masks = libnat.generate_insertion_labels(
-            out_tokens.int(),
-            libnat.levenshtein_distance(
-                in_tokens.int(),
+
+        # print("in_tokens: ", in_tokens)
+
+        if aggravate:
+            mask_ins_targets, masked_tgt_masks, tgt_masks = libnat.generate_insertion_labels_aggravate(
                 out_tokens.int(),
-                in_masks.sum(1).int(),
-                out_masks.sum(1).int(),
-            ),
-        )
-        masked_tgt_masks = masked_tgt_masks.bool() & out_masks
-        mask_ins_targets = mask_ins_targets.type_as(in_tokens)[
-            :, 1 : in_masks.size(1)
-        ].masked_fill_(~in_masks[:, 1:], 0)
-        masked_tgt_tokens = out_tokens.masked_fill(masked_tgt_masks, unk_idx)
-        return masked_tgt_masks, masked_tgt_tokens, mask_ins_targets
+                libnat.levenshtein_distance(
+                    in_tokens.int(),
+                    out_tokens.int(),
+                    in_masks.sum(1).int(),
+                    out_masks.sum(1).int(),
+                ),
+            )
+            
+            # print('cuda output mask_ins_targets, masked_tgt_masks, tgt_masks: ', mask_ins_targets, masked_tgt_masks, tgt_masks)
+        
+            masked_tgt_masks = masked_tgt_masks.bool()
+            tgt_masks = tgt_masks.bool()
+            mask_ins_targets = mask_ins_targets.type_as(in_tokens)[:, 1 : in_masks.size(1)]
+
+            masked_tgt_tokens = torch.full(  # len = in + out
+                masked_tgt_masks.size(), 
+                padding_idx,  # initial: all pad
+                dtype=out_tokens.dtype, 
+                device=out_tokens.device
+                )
+
+            masked_tgt_tokens[masked_tgt_masks] = unk_idx  # insert pld
+            
+            # insert input tokens
+            range_tensor = torch.arange(masked_tgt_masks.size(1), device=in_masks.device).unsqueeze(0)
+            range_tensor = range_tensor.expand(masked_tgt_masks.size(0), range_tensor.size(1))
+            remove_padding_mask = range_tensor < (in_masks.sum(1, keepdim=True) + mask_ins_targets.sum(1, keepdim=True))
+            
+            torch.set_printoptions(profile="full")
+            # print("remove_padding_mask:\n{}".format(remove_padding_mask))
+
+            masked_tgt_tokens.masked_scatter_(
+                    masked_tgt_masks ^ remove_padding_mask,
+                    in_tokens[in_masks]
+                )
+            
+            # print('masked_tgt_masks', masked_tgt_masks)
+            # print('masked_tgt_tokens', masked_tgt_tokens)
+
+            inserted_tgt_tokens = masked_tgt_tokens.clone()
+            inserted_tgt_tokens.masked_scatter_(masked_tgt_masks, out_tokens[tgt_masks])
+
+        else:
+            mask_ins_targets, masked_tgt_masks = libnat.generate_insertion_labels(
+                out_tokens.int(),
+                libnat.levenshtein_distance(
+                    in_tokens.int(),
+                    out_tokens.int(),
+                    in_masks.sum(1).int(),
+                    out_masks.sum(1).int(),
+                ),
+            )
+            
+            inserted_tgt_tokens = None
+            masked_tgt_masks = masked_tgt_masks.bool() & out_masks
+            mask_ins_targets = mask_ins_targets.type_as(in_tokens)[
+                :, 1 : in_masks.size(1)
+            ].masked_fill_(~in_masks[:, 1:], 0)
+            masked_tgt_tokens = out_tokens.masked_fill(masked_tgt_masks, unk_idx)
+
+        return masked_tgt_masks, masked_tgt_tokens, mask_ins_targets, inserted_tgt_tokens
 
     def _get_ins_targets_cpu(in_tokens, out_tokens, padding_idx, unk_idx):
         in_seq_len, out_seq_len = in_tokens.size(1), out_tokens.size(1)
@@ -74,27 +147,73 @@ def _get_ins_targets(in_tokens, out_tokens, padding_idx, unk_idx):
         ]
 
         # generate labels
-        masked_tgt_masks = []
-        for mask_input in mask_inputs:
-            mask_label = []
-            for beam_size in mask_input[1:-1]:  # HACK 1:-1
-                mask_label += [0] + [1 for _ in range(beam_size)]
-            masked_tgt_masks.append(
-                mask_label + [0 for _ in range(out_seq_len - len(mask_label))]
-            )
-        mask_ins_targets = [
-            mask_input[1:-1]
-            + [0 for _ in range(in_seq_len - 1 - len(mask_input[1:-1]))]
-            for mask_input in mask_inputs
-        ]
+        inserted_tgt_tokens = None
+        if not aggravate:
+            masked_tgt_masks = []
+            for mask_input in mask_inputs:
+                mask_label = []
+                for beam_size in mask_input[1:-1]:  # HACK 1:-1
+                    mask_label += [0] + [1 for _ in range(beam_size)]
+                masked_tgt_masks.append(
+                    mask_label + [0 for _ in range(out_seq_len - len(mask_label))]
+                )
+            mask_ins_targets = [
+                mask_input[1:-1]
+                + [0 for _ in range(in_seq_len - 1 - len(mask_input[1:-1]))]
+                for mask_input in mask_inputs
+            ]
+            # transform to tensor
+            masked_tgt_masks = torch.tensor(
+                masked_tgt_masks, device=out_tokens.device
+            ).bool()
+            mask_ins_targets = torch.tensor(mask_ins_targets, device=in_tokens.device)
+            masked_tgt_tokens = out_tokens.masked_fill(masked_tgt_masks, unk_idx)
 
-        # transform to tensor
-        masked_tgt_masks = torch.tensor(
-            masked_tgt_masks, device=out_tokens.device
-        ).bool()
-        mask_ins_targets = torch.tensor(mask_ins_targets, device=in_tokens.device)
-        masked_tgt_tokens = out_tokens.masked_fill(masked_tgt_masks, unk_idx)
-        return masked_tgt_masks, masked_tgt_tokens, mask_ins_targets
+            #return masked_tgt_masks, masked_tgt_tokens, mask_ins_targets
+
+        else: # if use aggravate, input is no longer a subsequence
+            masked_tgt_masks = []
+            masked_tgt_tokens = []
+            inserted_tgt_tokens = []
+            pad_to_len = 0
+            for idx, mask_input in enumerate(mask_inputs):
+                mask_label = []
+                masked_tgt_token = []
+                inserted_tgt_token = []
+                idx_input = 0
+                # note that the result is without eos and pad
+                for b_idx, beam_size in enumerate(mask_input[1:-1]):  # HACK 1:-1, i.e. remove bos, eos
+                    mask_label += [0] + [1 for _ in range(beam_size)]  # eg. ins 0220 -> 0 011 011 0
+                    masked_tgt_token += [in_tokens_list[idx][idx_input]] + [unk_idx for _ in range(beam_size)]
+                    inserted_tgt_token += [in_tokens_list[idx][idx_input]]
+                    if beam_size != 0:
+                        inserted_tgt_token += full_labels[idx][1 + b_idx]
+                    idx_input += 1
+                masked_tgt_masks.append(mask_label)
+                masked_tgt_tokens.append(masked_tgt_token)
+                inserted_tgt_tokens.append(inserted_tgt_token)
+                if len(masked_tgt_token) > pad_to_len:
+                    pad_to_len = len(masked_tgt_token)
+            # pad to max len after insertion, maybe longer than input and output
+            masked_tgt_masks = [mask_label + [2] + [0 for _ in range(pad_to_len - len(mask_label))] for mask_label in masked_tgt_masks]
+            masked_tgt_tokens = [masked_tgt_token + [2] + [0 for _ in range(pad_to_len - len(masked_tgt_token))] for masked_tgt_token in masked_tgt_tokens]
+            inserted_tgt_tokens = [inserted_tgt_token + [2] + [0 for _ in range(pad_to_len - len(inserted_tgt_token))] for inserted_tgt_token in inserted_tgt_tokens]
+
+            mask_ins_targets = [ # len = len(input)-1, later let pred also same len, easy for loss
+                mask_input[1:-1]
+                + [0 for _ in range(in_seq_len - 1 - len(mask_input[1:-1]))]
+                for mask_input in mask_inputs
+            ]
+
+            # transform to tensor
+            masked_tgt_masks = torch.tensor(
+                masked_tgt_masks, device=out_tokens.device
+            ).bool()
+            mask_ins_targets = torch.tensor(mask_ins_targets, device=in_tokens.device)
+            masked_tgt_tokens = torch.tensor(masked_tgt_tokens, device=in_tokens.device)
+            inserted_tgt_tokens = torch.tensor(inserted_tgt_tokens, device=in_tokens.device)
+
+        return masked_tgt_masks, masked_tgt_tokens, mask_ins_targets, inserted_tgt_tokens
 
     if use_cuda:
         return _get_ins_targets_cuda(in_tokens, out_tokens, padding_idx, unk_idx)

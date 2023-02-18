@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include <torch/extension.h>
+#include <torch/extension.h> // deperacated
 
 torch::Tensor LevenshteinDistanceCuda(
     torch::Tensor source,
@@ -21,5 +21,9 @@ torch::Tensor GenerateDeletionLabelCuda(
     torch::Tensor operations);
 
 std::pair<torch::Tensor, torch::Tensor> GenerateInsertionLabelCuda(
+    torch::Tensor source,
+    torch::Tensor operations);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GenerateInsertionLabelCudaAggravate(
     torch::Tensor source,
     torch::Tensor operations);

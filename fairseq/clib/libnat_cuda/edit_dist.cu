@@ -43,6 +43,63 @@ __global__ void generate_deletion_label_kernel(
 }
 
 template <typename scalar_t>
+__global__ void generate_insertion_label_kernel_aggravate(
+    const scalar_t* __restrict__ target,
+    const size_t target_size,
+    const size_t input_size, // my
+    const size_t operation_size,
+    int* __restrict__ operations,
+    int* __restrict__ labels,
+    int* __restrict__ masks,
+    int* __restrict__ tgt_masks) { // my
+  const int index = blockIdx.x;
+  const int offset = index * operation_size;
+  const int offset_label = index * input_size; // my
+  const int offset_tgt_mask = index * target_size; // my
+
+  int k = 0;
+  int u = 0;
+  int m = 0;
+  int n = 0;
+
+  for (int i = 0; i < input_size; i++) { // change to input_size
+    labels[offset_label + i] = 0;
+  }
+
+  for (int i = 0; i < operation_size; i++) {
+    masks[offset + i] = 0;
+  }
+
+  for (int i = 0; i < target_size; i++) { // my
+    tgt_masks[offset_tgt_mask + i] = 0;
+  }
+
+  for (int i = 0; i < operation_size - 1; i++) {
+    if (operations[offset + i] == 0) { // pad
+      break;
+    } else if (operations[offset + i] == 1) { // ins
+      masks[offset + m] = 1;
+      tgt_masks[offset_tgt_mask + n] = 1;
+      u++;
+      m++;
+      n++;
+    } else if (operations[offset + i] == 2) { // del
+      masks[offset + m] = 0;
+      m++;
+      k++;
+    } else if (operations[offset + i] == 3) { // correct
+      labels[offset_label + k] = u;
+      masks[offset + m] = 0;
+      tgt_masks[offset_tgt_mask + n] = 0;
+      k++;
+      m++;
+      u = 0;
+      n++;
+    }
+  }
+}
+
+template <typename scalar_t>
 __global__ void generate_insertion_label_kernel(
     const scalar_t* __restrict__ target,
     const size_t target_size,
@@ -57,7 +114,7 @@ __global__ void generate_insertion_label_kernel(
   int k = 0;
   int u = 0;
   int m = 0;
-
+  
   for (int i = 0; i < target_size; i++) {
     labels[offset_label + i] = 0;
     masks[offset_label + i] = 0;
@@ -271,16 +328,44 @@ torch::Tensor GenerateDeletionLabelCuda(
   return labels;
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GenerateInsertionLabelCudaAggravate( // change pair to tuple
+    torch::Tensor target,
+    torch::Tensor operations) {
+  const auto batch_size = target.size(0);
+  at::TensorOptions options(target.device());
+  options = options.dtype(at::ScalarType::Int);
+  auto stream = at::cuda::getCurrentCUDAStream(target.device().index());
+
+  auto tgt_masks = torch::empty({batch_size, target.size(1)}, options);
+  auto labels = torch::empty({batch_size, operations.size(1) - target.size(1)}, options);
+  auto masks = torch::empty({batch_size, operations.size(1)}, options);
+
+  AT_DISPATCH_ALL_TYPES(
+      target.scalar_type(), "generate_insertion_labels_aggravate", ([&] {
+        generate_insertion_label_kernel_aggravate<scalar_t><<<batch_size, 1, 0, stream>>>(
+            target.data_ptr<scalar_t>(),
+            target.size(1),
+            operations.size(1) - target.size(1),  // my: len(input)
+            operations.size(1),
+            operations.data_ptr<int>(),
+            labels.data_ptr<int>(),
+            masks.data_ptr<int>(),
+            tgt_masks.data_ptr<int>()); // my
+      }));
+  
+  return std::make_tuple(labels, masks, tgt_masks);
+}
+
 std::pair<torch::Tensor, torch::Tensor> GenerateInsertionLabelCuda(
     torch::Tensor target,
     torch::Tensor operations) {
   const auto batch_size = target.size(0);
   at::TensorOptions options(target.device());
   options = options.dtype(at::ScalarType::Int);
-  auto labels = torch::empty({batch_size, target.size(1)}, options);
-  auto masks = torch::empty({batch_size, target.size(1)}, options);
   auto stream = at::cuda::getCurrentCUDAStream(target.device().index());
 
+  auto labels = torch::empty({batch_size, target.size(1)}, options);
+  auto masks = torch::empty({batch_size, target.size(1)}, options);
   AT_DISPATCH_ALL_TYPES(
       target.scalar_type(), "generate_insertion_labels", ([&] {
         generate_insertion_label_kernel<scalar_t><<<batch_size, 1, 0, stream>>>(

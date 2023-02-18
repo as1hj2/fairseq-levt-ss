@@ -80,6 +80,33 @@ def collate(
 
     prev_output_tokens = None
     target = None
+    prev_target = None
+    # if samples[0].get("prev_target", None) is not None:
+        # combined = [s["target"] for s in samples]
+        # for s in samples:
+        #     combined.append(s["prev_target"])
+        # combined = data_utils.collate_tokens(
+        #     combined,
+        #     pad_idx,
+        #     eos_idx,
+        #     left_pad=left_pad_target,
+        #     pad_to_length=pad_to_length["target"]
+        #     if pad_to_length is not None
+        #     else None,
+        # )
+        # target = combined[:len(samples), :]
+        # target = target.index_select(0, sort_order)
+        # tgt_lengths = torch.LongTensor(
+        #     [s["target"].ne(pad_idx).long().sum() for s in samples]
+        # ).index_select(0, sort_order)
+        # ntokens = tgt_lengths.sum().item()
+        # prev_target = combined[len(samples):, :]
+        # prev_target = prev_target.index_select(0, sort_order)
+        # prev_tgt_lengths = torch.LongTensor(
+        #     [s["prev_target"].ne(pad_idx).long().sum() for s in samples]
+        # ).index_select(0, sort_order)
+        # ntokens = max(prev_tgt_lengths.sum().item(), ntokens)
+        
     if samples[0].get("target", None) is not None:
         target = merge(
             "target",
@@ -107,6 +134,21 @@ def collate(
                 if pad_to_length is not None
                 else None,
             )
+
+        if samples[0].get("prev_target", None) is not None:
+            prev_target = merge(
+                "prev_target",
+                left_pad=left_pad_target,
+                pad_to_length=pad_to_length["target"]
+                if pad_to_length is not None
+                else None,
+            )
+            prev_target = prev_target.index_select(0, sort_order)
+            prev_tgt_lengths = torch.LongTensor(
+                [s["prev_target"].ne(pad_idx).long().sum() for s in samples]
+            ).index_select(0, sort_order)
+            ntokens = max(ntokens, prev_tgt_lengths.sum().item())
+
     else:
         ntokens = src_lengths.sum().item()
 
@@ -124,6 +166,8 @@ def collate(
         batch["net_input"]["prev_output_tokens"] = prev_output_tokens.index_select(
             0, sort_order
         )
+    if prev_target is not None:
+        batch["prev_target"] = prev_target
 
     if samples[0].get("alignment", None) is not None:
         bsz, tgt_sz = batch["target"].shape
@@ -161,6 +205,31 @@ def collate(
         for i, sample in enumerate(samples):
             constraints[i, 0 : lens[i]] = samples[i].get("constraints")
         batch["constraints"] = constraints.index_select(0, sort_order)
+
+    if samples[0].get("prefix", None) is not None:
+        prefix = merge("prefix", left_pad=False)
+        prefix = prefix.index_select(0, sort_order)
+        if not prefix.numel():
+            prefix = None
+        batch["prefix"] = prefix
+
+    if samples[0].get("initial_lens", None) is not None:
+        initial_lens = merge(
+            "initial_lens",
+            left_pad=None,
+            pad_to_length=None
+        )
+        initial_lens = initial_lens.index_select(0, sort_order)
+        batch["initial_lens"] = initial_lens
+
+    if samples[0].get("initial", None) is not None:
+        initial = merge(
+            "initial",
+            left_pad=None,
+            pad_to_length=None
+        )
+        initial = initial.index_select(0, sort_order)
+        batch["initial"] = initial
 
     return batch
 
@@ -212,6 +281,8 @@ class LanguagePairDataset(FairseqDataset):
         tgt=None,
         tgt_sizes=None,
         tgt_dict=None,
+        prev_tgt=None,
+        prev_tgt_sizes=None,
         left_pad_source=True,
         left_pad_target=False,
         shuffle=True,
@@ -226,6 +297,9 @@ class LanguagePairDataset(FairseqDataset):
         src_lang_id=None,
         tgt_lang_id=None,
         pad_to_multiple=1,
+        prefix=None,
+        initial_lens=None,
+        initial_tokens=None,
     ):
         if tgt_dict is not None:
             assert src_dict.pad() == tgt_dict.pad()
@@ -237,13 +311,18 @@ class LanguagePairDataset(FairseqDataset):
             ), "Source and target must contain the same number of examples"
         self.src = src
         self.tgt = tgt
+        self.prev_tgt = prev_tgt
         self.src_sizes = np.array(src_sizes)
         self.tgt_sizes = np.array(tgt_sizes) if tgt_sizes is not None else None
-        self.sizes = (
-            np.vstack((self.src_sizes, self.tgt_sizes)).T
-            if self.tgt_sizes is not None
-            else self.src_sizes
-        )
+        self.prev_tgt_sizes = np.array(prev_tgt_sizes) if prev_tgt_sizes is not None else None
+        if self.prev_tgt_sizes is not None:
+            self.sizes = np.vstack((self.src_sizes, self.tgt_sizes, self.prev_tgt_sizes)).T
+        else:
+            self.sizes = (
+                np.vstack((self.src_sizes, self.tgt_sizes)).T
+                if self.tgt_sizes is not None
+                else self.src_sizes
+            )
         self.src_dict = src_dict
         self.tgt_dict = tgt_dict
         self.left_pad_source = left_pad_source
@@ -257,6 +336,7 @@ class LanguagePairDataset(FairseqDataset):
             assert (
                 self.tgt_sizes is not None
             ), "Both source and target needed when alignments are provided"
+        self.prefix = prefix
         self.constraints = constraints
         self.append_bos = append_bos
         self.eos = eos if eos is not None else src_dict.eos()
@@ -298,12 +378,16 @@ class LanguagePairDataset(FairseqDataset):
             self.buckets = None
         self.pad_to_multiple = pad_to_multiple
 
+        self.initial_lens = initial_lens
+        self.initial_tokens = initial_tokens
+
     def get_batch_shapes(self):
         return self.buckets
 
     def __getitem__(self, index):
         tgt_item = self.tgt[index] if self.tgt is not None else None
         src_item = self.src[index]
+        prev_tgt_item = self.prev_tgt[index] if self.prev_tgt is not None else None
         # Append EOS to end of tgt sentence if it does not have an EOS and remove
         # EOS from end of src sentence if it exists. This is useful when we use
         # use existing datasets for opposite directions i.e., when we want to
@@ -312,11 +396,15 @@ class LanguagePairDataset(FairseqDataset):
             eos = self.tgt_dict.eos() if self.tgt_dict else self.src_dict.eos()
             if self.tgt and self.tgt[index][-1] != eos:
                 tgt_item = torch.cat([self.tgt[index], torch.LongTensor([eos])])
+            if self.prev_tgt and self.prev_tgt[index][-1] != eos:
+                prev_tgt_item = torch.cat([self.prev_tgt[index], torch.LongTensor([eos])])
 
         if self.append_bos:
             bos = self.tgt_dict.bos() if self.tgt_dict else self.src_dict.bos()
             if self.tgt and self.tgt[index][0] != bos:
                 tgt_item = torch.cat([torch.LongTensor([bos]), self.tgt[index]])
+            if self.prev_tgt and self.prev_tgt[index][0] != bos:
+                prev_tgt_item = torch.cat([torch.LongTensor([bos]), self.prev_tgt[index]])
 
             bos = self.src_dict.bos()
             if self.src[index][0] != bos:
@@ -336,6 +424,22 @@ class LanguagePairDataset(FairseqDataset):
             example["alignment"] = self.align_dataset[index]
         if self.constraints is not None:
             example["constraints"] = self.constraints[index]
+        if self.prefix is not None: # prefix is a list of tensor bsz x seq
+            example["prefix"] = self.prefix[index]
+        if prev_tgt_item is not None:
+            example["prev_target"] = prev_tgt_item
+
+        if self.initial_lens is not None:
+            example['initial_lens'] = self.initial_lens[index]
+        
+        if self.initial_tokens is not None:
+            initial_item = torch.cat([
+                torch.LongTensor([self.tgt_dict.bos() if self.tgt_dict else self.src_dict.bos()]), 
+                self.initial_tokens[index], 
+                torch.LongTensor([self.tgt_dict.eos() if self.tgt_dict else self.src_dict.eos()])
+            ])
+            example["initial"] = initial_item
+
         return example
 
     def __len__(self):
@@ -406,6 +510,7 @@ class LanguagePairDataset(FairseqDataset):
         return max(
             self.src_sizes[index],
             self.tgt_sizes[index] if self.tgt_sizes is not None else 0,
+            self.prev_tgt_sizes[index] if self.prev_tgt_sizes is not None else 0,
         )
 
     def num_tokens_vec(self, indices):
@@ -414,15 +519,24 @@ class LanguagePairDataset(FairseqDataset):
         sizes = self.src_sizes[indices]
         if self.tgt_sizes is not None:
             sizes = np.maximum(sizes, self.tgt_sizes[indices])
+        if self.prev_tgt_sizes is not None:
+            sizes = np.maximum(sizes, self.prev_tgt_sizes[indices])
         return sizes
 
     def size(self, index):
         """Return an example's size as a float or tuple. This value is used when
         filtering a dataset with ``--max-positions``."""
-        return (
-            self.src_sizes[index],
-            self.tgt_sizes[index] if self.tgt_sizes is not None else 0,
-        )
+        if self.prev_tgt_sizes is not None:
+            return (
+                self.src_sizes[index],
+                self.tgt_sizes[index],
+                self.prev_tgt_sizes[index],
+            )
+        else:
+            return (
+                self.src_sizes[index],
+                self.tgt_sizes[index] if self.tgt_sizes is not None else 0,
+            )
 
     def ordered_indices(self):
         """Return an ordered list of indices. Batches will be constructed based
@@ -433,6 +547,8 @@ class LanguagePairDataset(FairseqDataset):
             indices = np.arange(len(self), dtype=np.int64)
         if self.buckets is None:
             # sort by target length, then source length
+            if self.prev_tgt_sizes is not None:
+                indices = indices[np.argsort(self.prev_tgt_sizes[indices], kind="mergesort")]
             if self.tgt_sizes is not None:
                 indices = indices[np.argsort(self.tgt_sizes[indices], kind="mergesort")]
             return indices[np.argsort(self.src_sizes[indices], kind="mergesort")]
@@ -447,12 +563,14 @@ class LanguagePairDataset(FairseqDataset):
     def supports_prefetch(self):
         return getattr(self.src, "supports_prefetch", False) and (
             getattr(self.tgt, "supports_prefetch", False) or self.tgt is None
-        )
+        ) and (getattr(self.prev_tgt, "suports_prefetch", False) or self.prev_tgt is None)
 
     def prefetch(self, indices):
         self.src.prefetch(indices)
         if self.tgt is not None:
             self.tgt.prefetch(indices)
+        if self.prev_tgt is not None:
+            self.prev_tgt.prefetch(indices)
         if self.align_dataset is not None:
             self.align_dataset.prefetch(indices)
 
@@ -469,9 +587,18 @@ class LanguagePairDataset(FairseqDataset):
             np.array: filtered sample array
             list: list of removed indices
         """
-        return data_utils.filter_paired_dataset_indices_by_size(
-            self.src_sizes,
-            self.tgt_sizes,
-            indices,
-            max_sizes,
-        )
+        if self.prev_tgt_sizes is not None:
+            return data_utils.filter_triplet_dataset_indices_by_size(
+                self.src_sizes,
+                self.tgt_sizes,
+                self.prev_tgt_sizes,
+                indices,
+                max_sizes
+            )
+        else:
+            return data_utils.filter_paired_dataset_indices_by_size(
+                self.src_sizes,
+                self.tgt_sizes,
+                indices,
+                max_sizes,
+            )

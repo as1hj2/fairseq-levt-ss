@@ -232,6 +232,7 @@ class LexicallyConstrainedBeamSearch(Search):
         self.vocab_size = len(tgt_dict)
         self.num_cands = 0
         self.supports_constraints = True
+        self.stop_on_max_len = True
 
     @torch.jit.export
     def init_constraints(self, batch_constraints: Optional[Tensor], beam_size: int):

@@ -82,7 +82,12 @@ def main(cfg: DictConfig, override_args=None):
     criterion = task.build_criterion(saved_cfg.criterion)
     criterion.eval()
 
-    for subset in cfg.dataset.valid_subset.split(","):
+    if cfg.common_eval.save_tensors:  # do validation on training set
+        choose_dataset = cfg.dataset.train_subset
+    else:
+        choose_dataset = cfg.dataset.valid_subset
+
+    for subset in choose_dataset.split(","):
         try:
             task.load_dataset(subset, combine=False, epoch=1, task_cfg=saved_cfg.task)
             dataset = task.dataset(subset)
@@ -115,11 +120,26 @@ def main(cfg: DictConfig, override_args=None):
         )
 
         log_outputs = []
-        for i, sample in enumerate(progress):
-            sample = utils.move_to_cuda(sample) if use_cuda else sample
-            _loss, _sample_size, log_output = task.valid_step(sample, model, criterion)
-            progress.log(log_output, step=i)
-            log_outputs.append(log_output)
+        if cfg.common_eval.save_tensors:
+            list_pld_tensors = []
+
+            for i, sample in enumerate(progress):
+                sample = utils.move_to_cuda(sample) if use_cuda else sample
+                _loss, _sample_size, log_output, pld_tensors = task.valid_step(sample, model, criterion, save_tensors=cfg.common_eval.save_tensors)
+                progress.log(log_output, step=i)
+                log_outputs.append(log_output)
+
+                list_pld_tensors.append(pld_tensors)
+
+            torch.save(list_pld_tensors, "/mnt/beegfs/home/zhou/levt/LevTSS/run-script/saved_tensors/valid_on_trainset_iter2.pt")
+        else:
+            for i, sample in enumerate(progress):
+                sample = utils.move_to_cuda(sample) if use_cuda else sample
+                _loss, _sample_size, log_output = task.valid_step(sample, model, criterion, save_tensors=cfg.common_eval.save_tensors) 
+                progress.log(log_output, step=i)
+                log_outputs.append(log_output)
+
+                list_pld_tensors.append(pld_tensors)
 
         if data_parallel_world_size > 1:
             log_outputs = distributed_utils.all_gather_list(

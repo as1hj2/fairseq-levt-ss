@@ -84,6 +84,7 @@ def last_n_checkpoints(paths, n, update_based, upper_bound=None):
 
     entries = []
     for f in files:
+        print(f)
         m = pt_regexp.fullmatch(f)
         if m is not None:
             sort_key = int(m.group(1))

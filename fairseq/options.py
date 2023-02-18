@@ -266,6 +266,8 @@ def add_preprocess_args(parser):
                        help="source language")
     group.add_argument("-t", "--target-lang", default=None, metavar="TARGET",
                        help="target language")
+    group.add_argument("--prev-target", default=None, metavar="PREV_TARGET",
+                       help="prev target language")
     group.add_argument("--trainpref", metavar="FP", default=None,
                        help="train file prefix (also used to build dictionaries)")
     group.add_argument("--validpref", metavar="FP", default=None,

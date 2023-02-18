@@ -58,6 +58,7 @@ def load_langpair_dataset(
     shuffle=True,
     pad_to_multiple=1,
     prepend_bos_src=None,
+    prev_target=None,
 ):
     def split_exists(split, src, tgt, lang, data_path):
         filename = os.path.join(data_path, "{}.{}-{}.{}".format(split, src, tgt, lang))
@@ -65,6 +66,7 @@ def load_langpair_dataset(
 
     src_datasets = []
     tgt_datasets = []
+    prev_tgt_datasets = []
 
     for k in itertools.count():
         split_k = split + (str(k) if k > 0 else "")
@@ -100,6 +102,15 @@ def load_langpair_dataset(
         )
         if tgt_dataset is not None:
             tgt_datasets.append(tgt_dataset)
+        if prev_target is not None:
+            prev_tgt_dataset = data_utils.load_indexed_dataset(
+                prefix + prev_target, tgt_dict, dataset_impl
+            )
+            if prev_tgt_dataset is not None:
+                prev_tgt_datasets.append(prev_tgt_dataset)
+            logger.info("loaded {} prev target examples from: {}/{}.{}-{}.{}".format(
+                len(prev_tgt_datasets[-1]), data_path, split_k, src, tgt, prev_target,
+            ))
 
         logger.info(
             "{} {} {}-{} {} examples".format(
@@ -111,10 +122,13 @@ def load_langpair_dataset(
             break
 
     assert len(src_datasets) == len(tgt_datasets) or len(tgt_datasets) == 0
+    if prev_target is not None:
+        assert len(tgt_datasets) == len(prev_tgt_datasets)
 
     if len(src_datasets) == 1:
         src_dataset = src_datasets[0]
         tgt_dataset = tgt_datasets[0] if len(tgt_datasets) > 0 else None
+        prev_tgt_dataset = prev_tgt_datasets[0] if len(prev_tgt_datasets) > 0 else None
     else:
         sample_ratios = [1] * len(src_datasets)
         sample_ratios[0] = upsample_primary
@@ -123,12 +137,18 @@ def load_langpair_dataset(
             tgt_dataset = ConcatDataset(tgt_datasets, sample_ratios)
         else:
             tgt_dataset = None
+        if len(prev_tgt_datasets) > 0:
+            prev_tgt_dataset = ConcatDataset(prev_tgt_datasets, sample_ratios)
+        else:
+            prev_tgt_dataset = None
 
     if prepend_bos:
         assert hasattr(src_dict, "bos_index") and hasattr(tgt_dict, "bos_index")
         src_dataset = PrependTokenDataset(src_dataset, src_dict.bos())
         if tgt_dataset is not None:
             tgt_dataset = PrependTokenDataset(tgt_dataset, tgt_dict.bos())
+        if prev_tgt_dataset is not None:
+            prev_tgt_dataset = PrependTokenDataset(prev_tgt_dataset, tgt_dict.bos())
     elif prepend_bos_src is not None:
         logger.info(f"prepending src bos: {prepend_bos_src}")
         src_dataset = PrependTokenDataset(src_dataset, prepend_bos_src)
@@ -142,6 +162,10 @@ def load_langpair_dataset(
             tgt_dataset = AppendTokenDataset(
                 tgt_dataset, tgt_dict.index("[{}]".format(tgt))
             )
+        if prev_tgt_dataset is not None:
+            prev_tgt_dataset = AppendTokenDataset(
+                prev_tgt_dataset, tgt_dict.index('[{}]'.forat(tgt))
+            )
         eos = tgt_dict.index("[{}]".format(tgt))
 
     align_dataset = None
@@ -153,6 +177,7 @@ def load_langpair_dataset(
             )
 
     tgt_dataset_sizes = tgt_dataset.sizes if tgt_dataset is not None else None
+    prev_tgt_dataset_sizes = prev_tgt_dataset.sizes if prev_tgt_dataset is not None else None
     return LanguagePairDataset(
         src_dataset,
         src_dataset.sizes,
@@ -160,6 +185,8 @@ def load_langpair_dataset(
         tgt_dataset,
         tgt_dataset_sizes,
         tgt_dict,
+        prev_tgt=prev_tgt_dataset,
+        prev_tgt_sizes=prev_tgt_dataset_sizes,
         left_pad_source=left_pad_source,
         left_pad_target=left_pad_target,
         align_dataset=align_dataset,
@@ -356,13 +383,14 @@ class TranslationTask(FairseqTask):
             pad_to_multiple=self.cfg.required_seq_len_multiple,
         )
 
-    def build_dataset_for_inference(self, src_tokens, src_lengths, constraints=None):
+    def build_dataset_for_inference(self, src_tokens, src_lengths, constraints=None, prefix=None):
         return LanguagePairDataset(
             src_tokens,
             src_lengths,
             self.source_dictionary,
             tgt_dict=self.target_dictionary,
             constraints=constraints,
+            prefix=prefix,
         )
 
     def build_model(self, cfg):
@@ -438,8 +466,8 @@ class TranslationTask(FairseqTask):
                     bleu = comp_bleu(
                         correct=meters["_bleu_counts"].sum,
                         total=meters["_bleu_totals"].sum,
-                        sys_len=meters["_bleu_sys_len"].sum,
-                        ref_len=meters["_bleu_ref_len"].sum,
+                        sys_len=int(meters["_bleu_sys_len"].sum),
+                        ref_len=int(meters["_bleu_ref_len"].sum),
                         **smooth,
                     )
                     return round(bleu.score, 2)

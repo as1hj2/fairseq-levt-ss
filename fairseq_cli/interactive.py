@@ -35,7 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger("fairseq_cli.interactive")
 
 
-Batch = namedtuple("Batch", "ids src_tokens src_lengths constraints")
+Batch = namedtuple("Batch", "ids src_tokens src_lengths constraints prefix initial_lens initial_tokens")
 Translation = namedtuple("Translation", "src_str hypos pos_scores alignments")
 
 
@@ -43,7 +43,7 @@ def buffered_read(input, buffer_size):
     buffer = []
     with fileinput.input(files=[input], openhook=fileinput.hook_encoded("utf-8")) as h:
         for src_str in h:
-            buffer.append(src_str.strip())
+            buffer.append(src_str.rstrip())
             if len(buffer) >= buffer_size:
                 yield buffer
                 buffer = []
@@ -74,17 +74,68 @@ def make_batches(lines, cfg, task, max_positions, encode_fn):
                 )
                 for constraint in constraint_list
             ]
+    elif cfg.generation.prefix_size > 0:
+        # Strip (tab-delimited) prefixes, if present, from input lines,
+        # store them in batch_prefix
+        batch_prefix = [list() for _ in lines]
+        for i, line in enumerate(lines):
+            if "\t" in line:
+                lines[i], *batch_prefix[i] = line.split("\t")
+
+        # Convert each List[List[str]] to List[List[Tensor]]
+        for i, prefix_list in enumerate(batch_prefix):
+            if not prefix_list:
+                prefix_list.append("")
+            batch_prefix[i] = task.target_dictionary.encode_line(
+                    encode_fn_target(prefix_list[0]),
+                    append_eos=False,
+                    add_if_not_exist=False,
+            ).long()
+    if not cfg.generation.prefix_size:
+        batch_prefix = None
 
     if cfg.generation.constraints:
         constraints_tensor = pack_constraints(batch_constraints)
     else:
         constraints_tensor = None
 
+    if cfg.generation.give_len:
+        batch_lens = [0 for _ in lines]
+        for i, line in enumerate(lines):
+            if "\t" in line:
+                lines[i], batch_lens[i] = line.split("\t")
+        # Convert each str to Tensor
+        for i, batch_len in enumerate(batch_lens):
+            batch_lens[i] = torch.tensor([int(batch_len)], dtype=torch.long) 
+    else:
+        batch_lens = None 
+
+    if cfg.generation.give_initial:
+        batch_initials = ['' for _ in lines]
+        for i, line in enumerate(lines):
+            if "\t" in line:
+                lines[i], batch_initials[i] = line.split("\t")
+        # Convert each str to Tensor
+        for i, batch_initial in enumerate(batch_initials):
+            if batch_initial != '':
+                batch_initials[i] = task.target_dictionary.encode_line(
+                                        encode_fn_target(batch_initial),
+                                        append_eos=False,
+                                        add_if_not_exist=False,
+                                    )
+            else:
+                batch_initials[i] = torch.IntTensor()
+    else:
+        batch_initials = None
+
     tokens, lengths = task.get_interactive_tokens_and_lengths(lines, encode_fn)
 
     itr = task.get_batch_iterator(
         dataset=task.build_dataset_for_inference(
-            tokens, lengths, constraints=constraints_tensor
+            tokens, lengths, constraints=constraints_tensor,
+            prefix=batch_prefix if batch_prefix is not None else None,
+            initial_lens=batch_lens,
+            initial_tokens=batch_initials,
         ),
         max_tokens=cfg.dataset.max_tokens,
         max_sentences=cfg.dataset.batch_size,
@@ -96,12 +147,18 @@ def make_batches(lines, cfg, task, max_positions, encode_fn):
         src_tokens = batch["net_input"]["src_tokens"]
         src_lengths = batch["net_input"]["src_lengths"]
         constraints = batch.get("constraints", None)
+        prefix = batch.get("prefix", None)
+        initial_lens = batch.get("initial_lens", None) 
+        initial_tokens = batch.get("initial", None)
 
         yield Batch(
             ids=ids,
             src_tokens=src_tokens,
             src_lengths=src_lengths,
             constraints=constraints,
+            prefix=prefix,
+            initial_lens=initial_lens,
+            initial_tokens=initial_tokens,
         )
 
 
@@ -211,21 +268,33 @@ def main(cfg: FairseqConfig):
             src_tokens = batch.src_tokens
             src_lengths = batch.src_lengths
             constraints = batch.constraints
+            prefix = batch.prefix
+            initial_lens = batch.initial_lens
+            initial_tokens = batch.initial_tokens
+
             if use_cuda:
                 src_tokens = src_tokens.cuda()
                 src_lengths = src_lengths.cuda()
                 if constraints is not None:
                     constraints = constraints.cuda()
+                if prefix is not None:
+                    prefix = prefix.cuda()
+                if initial_lens is not None:
+                    initial_lens = initial_lens.cuda()
+                if initial_tokens is not None:
+                    initial_tokens = initial_tokens.cuda()
 
             sample = {
                 "net_input": {
                     "src_tokens": src_tokens,
                     "src_lengths": src_lengths,
                 },
+                "initial_lens": initial_lens,
+                "initial_tokens": initial_tokens,
             }
             translate_start_time = time.time()
             translations = task.inference_step(
-                generator, models, sample, constraints=constraints
+                generator, models, sample, constraints=constraints, prefix_tokens=prefix
             )
             translate_time = time.time() - translate_start_time
             total_translate_time += translate_time
@@ -296,6 +365,20 @@ def main(cfg: FairseqConfig):
                         ["{}-{}".format(src, tgt) for src, tgt in alignment]
                     )
                     print("A-{}\t{}".format(id_, alignment_str))
+                if cfg.generation.print_step:
+                    print( "I-{}\t{}".format(id_, hypo["steps"]))
+
+                if cfg.generation.retain_iter_history:
+                    for step, h in enumerate(hypo["history"]):
+                        _, h_str, _ = utils.post_process_prediction(
+                            hypo_tokens=h["tokens"].int().cpu(),
+                            src_str=src_str,
+                            alignment=None,
+                            align_dict=None,
+                            tgt_dict=tgt_dict,
+                            remove_bpe=None,
+                        )
+                        print("E-{}_{}\t{}".format(id_, step, h_str))
 
         # update running id_ counter
         start_id += len(inputs)

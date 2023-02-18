@@ -18,8 +18,9 @@
 #define TORCH_CHECK AT_CHECK
 #endif
 
+//TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CUDA(x) \
-  TORCH_CHECK(x.type().is_cuda(), #x " must be a CUDA tensor")
+  TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS(x) \
   TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 #define CHECK_INPUT(x) \
@@ -54,6 +55,14 @@ std::pair<torch::Tensor, torch::Tensor> GenerateInsertionLabel(
   return GenerateInsertionLabelCuda(target, operations);
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> GenerateInsertionLabelAggravate(
+    torch::Tensor target,
+    torch::Tensor operations) {
+  CHECK_INPUT(target);
+  CHECK_INPUT(operations);
+  return GenerateInsertionLabelCudaAggravate(target, operations);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("levenshtein_distance", &LevenshteinDistance, "Levenshtein distance");
   m.def(
@@ -64,4 +73,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       "generate_insertion_labels",
       &GenerateInsertionLabel,
       "Generate Insertion Label");
+  m.def(
+  "generate_insertion_labels_aggravate",
+  &GenerateInsertionLabelAggravate,
+  "Generate Insertion Label Aggravate");
 }

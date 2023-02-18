@@ -5,6 +5,7 @@
 
 from dataclasses import dataclass, field
 import torch
+from typing import Optional
 from fairseq import utils
 from fairseq.data import LanguagePairDataset
 from fairseq.dataclass import ChoiceEnum
@@ -25,6 +26,25 @@ class TranslationLevenshteinConfig(TranslationConfig):
     noise: NOISE_CHOICES = field(
         default="random_delete",
         metadata={"help": "type of noise"},
+    )
+    prev_target: Optional[str] = field(
+        default=None, metadata={"help": "prev target language"}
+    )
+    prev_target_prob: float = field(
+        default=0.0,
+        metadata={"help": "probability to use prev target instead of generate on the fly"}
+    )
+    use_aggravate_prob: float = field(
+        default=0.5,
+        metadata={"help": "probability of using aggravate"}
+    )
+    sample1_prob: float = field(
+        default=0.5,
+        metadata={"help": "probability of sample first iteration (pld, tok)"}
+    )
+    new_del_input: bool = field(
+        default=False,
+        metadata={"help": "if True, give [empty -> exp pld -> tok pred] to del pred"}
     )
 
 
@@ -65,6 +85,7 @@ class TranslationLevenshteinTask(TranslationTask):
             max_source_positions=self.cfg.max_source_positions,
             max_target_positions=self.cfg.max_target_positions,
             prepend_bos=True,
+            prev_target=self.cfg.prev_target,
         )
 
     def inject_noise(self, target_tokens):
@@ -163,9 +184,11 @@ class TranslationLevenshteinTask(TranslationTask):
             decoding_format=getattr(args, "decoding_format", None),
             adaptive=not getattr(args, "iter_decode_force_max_iter", False),
             retain_history=getattr(args, "retain_iter_history", False),
+            delete_threshold=getattr(args, "delete_threshold", 0.0),
+            use_pld_dp=getattr(args, "use_pld_dp", False),
         )
 
-    def build_dataset_for_inference(self, src_tokens, src_lengths, constraints=None):
+    def build_dataset_for_inference(self, src_tokens, src_lengths, constraints=None, prefix=None, initial_lens=None, initial_tokens=None,):
         if constraints is not None:
             # Though see Susanto et al. (ACL 2020): https://www.aclweb.org/anthology/2020.acl-main.325/
             raise NotImplementedError(
@@ -173,23 +196,89 @@ class TranslationLevenshteinTask(TranslationTask):
             )
 
         return LanguagePairDataset(
-            src_tokens, src_lengths, self.source_dictionary, append_bos=True
+            src_tokens, src_lengths, self.source_dictionary, append_bos=True, prefix=prefix, initial_lens=initial_lens, initial_tokens=initial_tokens,
         )
 
     def train_step(
         self, sample, model, criterion, optimizer, update_num, ignore_grad=False
     ):
+        aggravate = torch.rand(1) >= self.cfg.use_aggravate_prob
+        # aggravate = True
+        # print('aggravate: ', aggravate)
+
+        if not aggravate:
+            sample["prev_target"] = self.inject_noise(sample["target"])
+            # sample["prev_target"] = torch.tensor([[0,6,6,6,6,6,6,2]], dtype=torch.int)
+            sampled_step = None
+            word_predictions = None
+
+        else:
+            # assert sample.get("prev_target", None) is not None
+            # initialize <bos><eos>
+            sample["prev_target"] = sample["target"].new_zeros(sample["target"].size(0), 2)
+            sample["prev_target"][:, 0] = self.tgt_dict.bos()
+            sample["prev_target"][:, 1] = self.tgt_dict.eos()
+
+            # print("sample[prev_target]:\n{}".format(sample["prev_target"]))
+            # print("sample[target]:\n{}".format(sample["target"]))
+
+            sample1 = torch.rand(1) >= self.cfg.sample1_prob
+            sampled_step = 1 if sample1 else 3
+            # sampled_step = 3
+            
+            # print('update_num: ', update_num)
+            # print('sampled_step: ', sampled_step)
+
+            # if sampled_step == 1 and self.cfg.new_del_input:
+            if self.cfg.new_del_input:
+                word_predictions = None
+            else:
+                model.eval()
+                word_predictions = model.pre_predict(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["prev_target"], sample["target"], sampled_step)
+                
+            # print("Using prev target data")
+            # sample["prev_target"] = sample["target"]
+            # if update_num > 270:
+            #     print("STEP {} sample id: {}".format(update_num, sample["id"]))
+
         model.train()
-        sample["prev_target"] = self.inject_noise(sample["target"])
-        loss, sample_size, logging_output = criterion(model, sample)
+        loss, sample_size, logging_output = criterion(model, sample, aggravate=aggravate, sampled_step=sampled_step, word_predictions=word_predictions, new_del_input=self.cfg.new_del_input)
+        
+        # print('logging_output: ', logging_output)
+
         if ignore_grad:
             loss *= 0
         optimizer.backward(loss)
         return loss, sample_size, logging_output
 
-    def valid_step(self, sample, model, criterion):
+    def valid_step(self, sample, model, criterion, save_tensors=False):
         model.eval()
         with torch.no_grad():
-            sample["prev_target"] = self.inject_noise(sample["target"])
-            loss, sample_size, logging_output = criterion(model, sample)
-        return loss, sample_size, logging_output
+            # if torch.rand(1) >= self.cfg.prev_target_prob:
+            #     sample["prev_target"] = self.inject_noise(sample["target"])
+            # else:
+            #     assert sample.get("prev_target", None) is not None
+
+            # aggravate
+            sample["prev_target"] = sample["target"].new_zeros(sample["target"].size(0), 2)
+            sample["prev_target"][:, 0] = self.tgt_dict.bos()
+            sample["prev_target"][:, 1] = self.tgt_dict.eos()
+
+            # defaut setting, should manually change here
+            sampled_step = 3
+            new_del_input = True
+            
+            # torch.set_printoptions(profile="full")
+            # print('prev_predictions:\n{}'.format(word_predictions))
+            # print('target:\n{}'.format(sample["target"]))
+            if new_del_input:
+                word_predictions = None
+            else:
+                word_predictions = model.pre_predict(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["prev_target"], sample["target"], sampled_step)
+
+            if save_tensors:
+                loss, sample_size, logging_output, pld_tensors = criterion(model, sample, aggravate=True, sampled_step=sampled_step, word_predictions=word_predictions, new_del_input=new_del_input, save_tensors=save_tensors)
+                return loss, sample_size, logging_output, pld_tensors
+            else:
+                loss, sample_size, logging_output = criterion(model, sample, aggravate=True, sampled_step=sampled_step, word_predictions=word_predictions, new_del_input=True, save_tensors=save_tensors)
+                return loss, sample_size, logging_output

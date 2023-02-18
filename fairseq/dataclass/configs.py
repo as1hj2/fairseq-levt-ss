@@ -981,6 +981,26 @@ class GenerationConfig(FairseqDataclass):
         metadata={"help": "if set, dont use seed for initializing random generators"},
     )
 
+    delete_threshold: float = field(
+        default=0.,
+        metadata={"help": "threshold of score difference between delete and not"},
+    )
+
+    use_pld_dp: bool = field(
+        default=False,
+        metadata={"help": "whether to use pld len dp during decoding"},
+    )
+
+    give_len: bool = field(
+        default=False,
+        metadata={"help": "give initial decoding lengths or not"},
+    )
+
+    give_initial: bool = field(
+        default=False,
+        metadata={"help": "give initial decoding tokens or not"},
+    )
+
 
 @dataclass
 class CommonEvalConfig(FairseqDataclass):
@@ -1008,6 +1028,10 @@ class CommonEvalConfig(FairseqDataclass):
     )
     results_path: Optional[str] = field(
         default=None, metadata={"help": "path to save eval results (optional)"}
+    )
+
+    save_tensors: Optional[bool] = field(
+        default=None, metadata={"help": "save each module's predictions for iter2 on training set"}
     )
 
 

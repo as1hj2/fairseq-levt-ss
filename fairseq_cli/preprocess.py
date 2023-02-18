@@ -7,6 +7,7 @@
 Data pre-processing: build vocabularies and binarize training data.
 """
 
+from distutils.command.build import build
 import logging
 import os
 import shutil
@@ -92,10 +93,16 @@ def main(args):
             assert (
                 args.trainpref
             ), "--trainpref must be set if --srcdict is not specified"
-            src_dict = build_dictionary(
-                {train_path(lang) for lang in [args.source_lang, args.target_lang]},
-                src=True,
-            )
+            if args.prev_target:
+                src_dict = build_dictionary(
+                    {train_path(lang) for lang in [args.source_lang, args.
+                    target_lang, args.prev_target]}, src=True,
+                )
+            else:
+                src_dict = build_dictionary(
+                    {train_path(lang) for lang in [args.source_lang, args.target_lang]},
+                    src=True,
+                )
         tgt_dict = src_dict
     else:
         if args.srcdict:
@@ -113,7 +120,13 @@ def main(args):
                 assert (
                     args.trainpref
                 ), "--trainpref must be set if --tgtdict is not specified"
-                tgt_dict = build_dictionary([train_path(args.target_lang)], tgt=True)
+                if args.prev_target:
+                    tgt_dict = build_dictionary(
+                        {train_path(lang) for lang in [args.target_lang,
+                        args.prev_target]}, tgt=True,
+                    )
+                else:
+                    tgt_dict = build_dictionary([train_path(args.target_lang)], tgt=True)
         else:
             tgt_dict = None
 
@@ -301,6 +314,8 @@ def main(args):
     make_all(args.source_lang, src_dict)
     if target:
         make_all(args.target_lang, tgt_dict)
+    if args.prev_target:
+        make_all(args.prev_target, tgt_dict)
     if args.align_suffix:
         make_all_alignments()
 

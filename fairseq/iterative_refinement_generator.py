@@ -30,6 +30,8 @@ class IterativeRefinementGenerator(object):
         adaptive=True,
         retain_history=False,
         reranking=False,
+        delete_threshold=0.0,
+        use_pld_dp=False,
     ):
         """
         Generates translations based on iterative refinement.
@@ -42,6 +44,7 @@ class IterativeRefinementGenerator(object):
             decoding_format: decoding mode in {'unigram', 'ensemble', 'vote', 'dp', 'bs'}
             retain_dropout: retaining dropout in the inference
             adaptive: decoding with early stop
+            delete_threshold: threshold for deletion pred
         """
         self.bos = tgt_dict.bos()
         self.pad = tgt_dict.pad()
@@ -58,6 +61,8 @@ class IterativeRefinementGenerator(object):
         self.retain_history = retain_history
         self.adaptive = adaptive
         self.models = models
+        self.delete_threshold = delete_threshold
+        self.use_pld_dp = use_pld_dp
 
     def generate_batched_itr(
         self,
@@ -130,10 +135,12 @@ class IterativeRefinementGenerator(object):
         src_tokens = sample["net_input"]["src_tokens"]
         src_lengths = sample["net_input"]["src_lengths"]
         bsz, src_len = src_tokens.size()
+        initial_lens = sample["initial_lens"]
+        initial_tokens = sample["initial_tokens"]
 
         # initialize
         encoder_out = model.forward_encoder([src_tokens, src_lengths])
-        prev_decoder_out = model.initialize_output_tokens(encoder_out, src_tokens)
+        prev_decoder_out = model.initialize_output_tokens(encoder_out, src_tokens, initial_tokens=initial_tokens)  # or initial_tokens=prefix_tokens
 
         if self.beam_size > 1:
             assert (
@@ -196,21 +203,33 @@ class IterativeRefinementGenerator(object):
                 "alignment": alignment,
             }
 
+        initial_ins_pred = None
         for step in range(self.max_iter + 1):
 
             decoder_options = {
                 "eos_penalty": self.eos_penalty,
                 "max_ratio": self.max_ratio,
                 "decoding_format": self.decoding_format,
+                "delete_threshold": self.delete_threshold,
+                "use_pld_dp": self.use_pld_dp,
+                "initial_lens": initial_lens,
+                
             }
+            
             prev_decoder_out = prev_decoder_out._replace(
                 step=step,
                 max_step=self.max_iter + 1,
             )
 
-            decoder_out = model.forward_decoder(
-                prev_decoder_out, encoder_out, **decoder_options
-            )
+            if self.use_pld_dp and step == 0:
+                decoder_out, initial_ins_pred = model.forward_decoder(
+                    prev_decoder_out, encoder_out, initial_ins_pred=None, step=step, **decoder_options
+                )
+                initial_ins_pred = initial_ins_pred + 2  # pld len pred + bos + eos = true sent len
+            else:
+                decoder_out = model.forward_decoder(
+                    prev_decoder_out, encoder_out, initial_ins_pred=initial_ins_pred, step=step, **decoder_options
+                )
 
             if self.adaptive:
                 # terminate if there is a loop
@@ -287,6 +306,9 @@ class IterativeRefinementGenerator(object):
             )
             sent_idxs = sent_idxs[not_terminated]
             prev_output_tokens = prev_decoder_out.output_tokens.clone()
+
+            if self.use_pld_dp:  # corresponds to output_tokens
+                initial_ins_pred = initial_ins_pred[not_terminated]
 
         if self.beam_size > 1:
             if reranker is not None:

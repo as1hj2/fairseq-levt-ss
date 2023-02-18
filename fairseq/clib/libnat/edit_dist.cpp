@@ -17,8 +17,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <limits>
 
 using namespace ::std;
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 vector<vector<uint32_t>> edit_distance2_with_dp(
     vector<uint32_t>& x,
@@ -40,6 +44,45 @@ vector<vector<uint32_t>> edit_distance2_with_dp(
     }
   }
   return d;
+}
+
+pair<vector<vector<uint32_t> >, vector<vector<float> > > pld_len_dp(
+    vector<vector<float> > &P, // L-1 * K+1, because 0~K
+    int32_t L,               // initial len
+    int32_t M,               // obj len
+    int32_t K)               // max pld len
+{ 
+    vector<vector<uint32_t> > predecessor(L, vector<uint32_t>(M - L + 1));
+    vector<vector<float> > cost(L, vector<float>(M - L + 1, std::numeric_limits<float>::max()));  // cumulative
+    pair<vector<vector<uint32_t> >, vector<vector<float> > > d(predecessor, cost);
+
+    // row 1 can only come from (0,0)
+    for (uint32_t j = MAX(0, M - L - (L - 1 - 1) * K); j <= MIN(M - L, K); j++) {
+        d.first[1][j] = 0; 
+        d.second[1][j] = P[0][j];
+        // printf("row1: j=%u bestpre=0 bestcost=%f\n", j, P[0][j]);
+    }
+
+    for (int32_t i = 2; i < L; i++)
+    {
+        for (int32_t j = MAX(0, M - L - (L - 1 - i) * K); j <= MIN(M - L, i * K); j++)
+        {
+            uint32_t best_pre = 0;
+            float best_cost = std::numeric_limits<float>::max();
+            for (uint32_t pre = MAX(0, j - K); pre <= j; pre++)
+            {
+                if (d.second[i - 1][pre] + P[i - 1][j - pre] < best_cost)
+                {
+                    best_pre = pre;
+                    best_cost = d.second[i - 1][pre] + P[i - 1][j - pre];
+                }
+            }
+            d.first[i][j] = best_pre;
+            d.second[i][j] = best_cost;
+            // printf("row%u: j=%u bestpre=%u bestcost=%f\n", i, j, best_pre, best_cost);
+        }
+    }
+    return d;
 }
 
 vector<vector<uint32_t>> edit_distance2_backtracking(
@@ -111,6 +154,28 @@ vector<vector<uint32_t>> edit_distance2_backtracking(
     }
   }
   return edit_seqs;
+}
+
+pair<vector<uint32_t>, vector<float> > pld_len_backtracking(
+    pair<vector<vector<uint32_t> >, vector<vector<float> > > &d,
+    int32_t L,
+    int32_t M,
+    int32_t K,
+    uint32_t padded_len)
+{
+
+    // L-1 positions that need pld pred
+    pair<vector<uint32_t>, vector<float> > path(vector<uint32_t>(padded_len, 0), vector<float>(padded_len, 0));
+
+    uint32_t chosen = M - L;
+    for (uint32_t i = L - 1; i > 0; i--)
+    {
+        path.first[i-1] = chosen - d.first[i][chosen];  // current len - predecessor
+        path.second[i-1] = d.second[i][chosen];  // current cumulative cost
+        chosen = d.first[i][chosen];  // move to predecessor
+    }
+
+    return path;
 }
 
 vector<vector<uint32_t>> edit_distance2_backtracking_with_delete(
@@ -221,6 +286,36 @@ vector<vector<vector<uint32_t>>> suggested_ed2_path_with_delete(
   return seq;
 }
 
+pair<vector<vector<uint32_t> >, vector<vector<float> > > suggested_pld_len(
+    vector<vector<vector<float> > > &Ps,
+    vector<int32_t> Ls,
+    vector<int32_t> Ms,
+    int32_t K )
+{
+
+    // vector<vector<uint32_t> > predecessor(Ps.size(), vector<uint32_t>(Ls - 1));
+    // vector<vector<float> > cost(Ps.size(), vector<float>(Ls - 1));
+
+    pair<vector<vector<uint32_t> >, vector<vector<float> > > seq;
+    uint32_t padded_len = Ps[0].size();
+
+    for (uint32_t i = 0; i < Ps.size(); i++)
+    {
+        // printf("new sample\n");
+        if (Ls[i] >= Ms[i]) {
+            seq.first.push_back(vector<uint32_t>(padded_len, 0));
+            seq.second.push_back(vector<float>(padded_len, 0));
+        }
+        else {
+          pair<vector<vector<uint32_t> >, vector<vector<float> > > d = pld_len_dp(Ps.at(i), Ls.at(i), Ms.at(i), K);
+          pair<vector<uint32_t>, vector<float> > path = pld_len_backtracking(d, Ls.at(i), Ms.at(i), K, padded_len);
+          seq.first.push_back(path.first);
+          seq.second.push_back(path.second);
+        }
+    }
+    return seq;
+}
+
 PYBIND11_MODULE(libnat, m) {
   m.def("compute_ed2", &compute_ed2, "compute_ed2");
   m.def("suggested_ed2_path", &suggested_ed2_path, "suggested_ed2_path");
@@ -228,4 +323,6 @@ PYBIND11_MODULE(libnat, m) {
       "suggested_ed2_path_with_delete",
       &suggested_ed2_path_with_delete,
       "suggested_ed2_path_with_delete");
+
+  m.def("suggested_pld_len", &suggested_pld_len, "suggested_pld_len");
 }
